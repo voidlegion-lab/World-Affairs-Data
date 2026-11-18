@@ -1,0 +1,15 @@
+[
+  {"name": "BBC News", "url": "https://feeds.bbci.co.uk/news/world/rss.xml"},
+  {"name": "DW", "url": "https://rss.dw.com/rdf/rss-en-all"},
+  {"name": "France 24", "url": "https://www.france24.com/en/rss"},
+  {"name": "Dawn", "url": "https://www.dawn.com/feeds/home"},
+  {"name": "The Express Tribune", "url": "https://tribune.com.pk/feed/home"},
+  {"name": "Business Recorder", "url": "https://www.brecorder.com/feeds/latest-news"},
+  {"name": "UN News", "url": "https://news.un.org/feed/subscribe/en/news/all/rss.xml"},
+  {"name": "The Guardian", "url": "https://www.theguardian.com/world/rss"},
+  {"name": "New York Times", "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"},
+  {"name": "Bloomberg", "url": "https://www.bloomberg.com/feeds/news.rss"},
+  {"name": "Financial Times", "url": "https://www.ft.com/world?format=rss"},
+  {"name": "SCMP Asia", "url": "https://www.scmp.com/rss/3/feed"},
+  {"name": "SCMP World", "url": "https://www.scmp.com/rss/5/feed"}
+]
