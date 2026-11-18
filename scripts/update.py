@@ -291,7 +291,8 @@ def call_gemini(model, key, user_text):
     body = {
         "systemInstruction": {"parts": [{"text": SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json",
+                             "maxOutputTokens": 8192},
     }
     last = None
     for attempt in range(4):
@@ -348,34 +349,56 @@ def parse_ai(text):
     return out
 
 
+def ask_ai(batch, model, key, mock):
+    if mock:
+        return mock_gemini(batch)
+    prompt = SCHEMA_HINT + "\n\nStories:\n" + json.dumps(batch, ensure_ascii=False)
+    text = call_gemini(model, key, prompt)
+    time.sleep(5)
+    return text
+
+
+def make_batch(events):
+    return [{
+        "id": event_id(ev),
+        "sources": [{"source": i["source"], "headline": i["title"],
+                     "excerpt": i["snippet"][:EXCERPT_FOR_AI]} for i in ev],
+    } for ev in events]
+
+
 def summarise(pending, key, mock=False):
     """pending: list of events. Returns (results dict id -> ai, stats)."""
-    results, requests_made, errors = {}, 0, []
+    results, requests_made, errors, skipped = {}, 0, [], 0
     model = "mock" if mock else pick_model(key)
     print(f"Using model: {model}")
     for start in range(0, len(pending), BATCH_SIZE):
         if requests_made >= MAX_AI_REQUESTS:
             break
         chunk = pending[start:start + BATCH_SIZE]
-        batch = [{
-            "id": event_id(ev),
-            "sources": [{"source": i["source"], "headline": i["title"],
-                         "excerpt": i["snippet"][:EXCERPT_FOR_AI]} for i in ev],
-        } for ev in chunk]
+        batch = make_batch(chunk)
+        wanted = {b["id"] for b in batch}
         try:
-            if mock:
-                text = mock_gemini(batch)
+            requests_made += 1
+            got = parse_ai(ask_ai(batch, model, key, mock))
+            got = {k: v for k, v in got.items() if k in wanted}
+            results.update(got)
+            missing = [ev for ev in chunk if event_id(ev) not in got]
+            print(f"Batch {requests_made}: asked {len(chunk)}, received {len(got)}")
+            # The AI sometimes leaves stories out: ask once more for just those.
+            if missing and requests_made < MAX_AI_REQUESTS:
+                requests_made += 1
+                retry = make_batch(missing)
+                got2 = parse_ai(ask_ai(retry, model, key, mock))
+                got2 = {k: v for k, v in got2.items() if k in {r["id"] for r in retry}}
+                results.update(got2)
+                print(f"Batch {requests_made} (retry): asked {len(missing)}, received {len(got2)}")
+                skipped += len(missing) - len(got2)
             else:
-                prompt = SCHEMA_HINT + "\n\nStories:\n" + json.dumps(batch, ensure_ascii=False)
-                text = call_gemini(model, key, prompt)
-                time.sleep(5)
-            requests_made += 1
-            results.update(parse_ai(text))
+                skipped += len(missing)
         except Exception as e:
-            requests_made += 1
             errors.append(str(e)[:200])
             print(f"AI batch failed: {e}", file=sys.stderr)
-    return results, {"model": model, "requests": requests_made, "errors": errors}
+    return results, {"model": model, "requests": requests_made, "errors": errors, "skipped": skipped}
 
 # -------------------------------------------------------------------------- main
 
@@ -415,7 +438,7 @@ def main():
     # multi-source stories first, then newest
     pending.sort(key=lambda ev: (-len(ev), -max(i["published"] for i in ev).timestamp()))
 
-    ai_stats = {"model": None, "requests": 0, "errors": []}
+    ai_stats = {"model": None, "requests": 0, "errors": [], "skipped": 0}
     results = {}
     if pending and (key or args.mock):
         results, ai_stats = summarise(pending, key, mock=args.mock)
