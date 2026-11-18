@@ -150,13 +150,28 @@ def decode_body(raw):
 
 
 def fetch_url(url, timeout=30):
-    req = urllib.request.Request(url, headers={
+    """Downloads a feed. If a site answers 403/406/429 or fails once, tries once more with a plainer request."""
+    base = {
         "User-Agent": USER_AGENT,
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        "Accept-Encoding": "gzip",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return decode_body(resp.read())
+    }
+    attempts = [dict(base, **{"Accept-Encoding": "gzip"}), dict(base)]
+    for i, headers in enumerate(attempts):
+        last_attempt = i + 1 == len(attempts)
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return decode_body(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 406, 429) and not last_attempt:
+                time.sleep(3)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError):
+            if not last_attempt:
+                time.sleep(5)
+                continue
+            raise
 
 
 def slug(name):
