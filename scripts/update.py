@@ -10,6 +10,7 @@ Run with:  python scripts/update.py            (real run, needs GEMINI_API_KEY f
            python scripts/update.py --mock --fixtures tests/fixtures --out /tmp/out.json   (offline test)
 """
 import argparse
+import gzip
 import hashlib
 import html
 import json
@@ -30,7 +31,7 @@ DATA_FILE = ROOT / "data" / "stories.json"
 WINDOW_HOURS = 72            # stories older than this are dropped
 MAX_EVENTS = 400             # size limit for the published file
 BATCH_SIZE = 8               # stories per AI request
-MAX_AI_REQUESTS = 12         # AI requests per run (keeps the free tier safe)
+MAX_AI_REQUESTS = 16         # AI requests per run (keeps the free tier safe)
 EXCERPT_FOR_AI = 600         # characters of each excerpt sent to the AI
 USER_AGENT = "Mozilla/5.0 (compatible; WorldAffairsPersonalReader/1.0)"
 
@@ -101,7 +102,11 @@ def is_digest(snippet):
 
 def parse_feed(raw, source):
     """Returns items using only the item's own direct title/link/description/date."""
-    root = ET.fromstring(fix_xml(raw))
+    raw = decode_body(raw)
+    try:
+        root = ET.fromstring(fix_xml(raw))
+    except ET.ParseError as e:
+        raise ValueError(f"not readable as a feed ({e}); starts with {raw[:60]!r}")
     out = []
     for item in root.iter():
         ns, local = split_tag(item.tag)
@@ -135,13 +140,23 @@ def parse_feed(raw, source):
     return out
 
 
+def decode_body(raw):
+    """Unpacks gzip data (some sites send it even when not asked) and removes a byte-order mark."""
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    if raw[:3] == b"\xef\xbb\xbf":
+        raw = raw[3:]
+    return raw
+
+
 def fetch_url(url, timeout=30):
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Accept-Encoding": "gzip",
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+        return decode_body(resp.read())
 
 
 def slug(name):
@@ -240,6 +255,24 @@ SCHEMA_HINT = """Return JSON in exactly this shape:
  "background_ai": "",
  "exam_points": ["..."]}]}"""
 
+_STR = {"type": "STRING"}
+_LIST = {"type": "ARRAY", "items": {"type": "STRING"}}
+RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {"stories": {"type": "ARRAY", "items": {
+        "type": "OBJECT",
+        "properties": {
+            "id": _STR, "short_summary": _STR, "detailed_summary": _STR,
+            "key_facts": _LIST, "unconfirmed": _LIST, "discrepancies": _LIST,
+            "significance": _STR, "background_ai": _STR, "exam_points": _LIST,
+        },
+        "required": ["id", "short_summary", "detailed_summary", "key_facts", "unconfirmed",
+                     "discrepancies", "significance", "background_ai", "exam_points"],
+    }}},
+    "required": ["stories"],
+}
+_use_schema = True
+
 AI_TEXT_FIELDS = ["short_summary", "detailed_summary", "significance", "background_ai"]
 AI_LIST_FIELDS = ["key_facts", "unconfirmed", "discrepancies", "exam_points"]
 
@@ -286,22 +319,32 @@ def pick_model(key):
     return "gemini-2.5-flash-lite"
 
 
-def call_gemini(model, key, user_text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = {
+def build_body(user_text, with_schema):
+    config = {"temperature": 0.2, "responseMimeType": "application/json", "maxOutputTokens": 8192}
+    if with_schema:
+        config["responseSchema"] = RESPONSE_SCHEMA
+    return {
         "systemInstruction": {"parts": [{"text": SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json",
-                             "maxOutputTokens": 8192},
+        "generationConfig": config,
     }
+
+
+def call_gemini(model, key, user_text):
+    global _use_schema
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     last = None
     for attempt in range(4):
         try:
-            data = http_json(url, key, body)
+            data = http_json(url, key, build_body(user_text, _use_schema))
             parts = data["candidates"][0]["content"]["parts"]
             return "".join(p.get("text", "") for p in parts if not p.get("thought"))
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}"
+            if e.code == 400 and _use_schema:
+                print("Gemini rejected the fixed-structure request; trying without it.", file=sys.stderr)
+                _use_schema = False
+                continue
             if e.code in (429, 500, 503):
                 wait = 20 * (attempt + 1)
                 retry_after = e.headers.get("Retry-After")
@@ -332,7 +375,9 @@ def mock_gemini(batch):
 def parse_ai(text):
     text = text.strip()
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
-    data = json.loads(text)
+    start = min([i for i in (text.find("{"), text.find("[")) if i >= 0], default=0)
+    # raw_decode reads the first complete JSON value and ignores anything after it
+    data, _ = json.JSONDecoder().raw_decode(text[start:])
     stories = data.get("stories", []) if isinstance(data, dict) else data
     out = {}
     for s in stories:
@@ -368,37 +413,59 @@ def make_batch(events):
 
 def summarise(pending, key, mock=False):
     """pending: list of events. Returns (results dict id -> ai, stats)."""
-    results, requests_made, errors, skipped = {}, 0, [], 0
+    results, errors = {}, []
+    state = {"requests": 0}
     model = "mock" if mock else pick_model(key)
     print(f"Using model: {model}")
+
+    def attempt(events, label):
+        batch = make_batch(events)
+        wanted = {b["id"] for b in batch}
+        state["requests"] += 1
+        num = state["requests"]
+        got = parse_ai(ask_ai(batch, model, key, mock))
+        got = {k: v for k, v in got.items() if k in wanted}
+        results.update(got)
+        print(f"Batch {num}{label}: asked {len(events)}, received {len(got)}")
+        return got
+
+    def missing_of(events):
+        return [ev for ev in events if event_id(ev) not in results]
+
+    handled = []
     for start in range(0, len(pending), BATCH_SIZE):
-        if requests_made >= MAX_AI_REQUESTS:
+        if state["requests"] >= MAX_AI_REQUESTS:
             break
         chunk = pending[start:start + BATCH_SIZE]
-        batch = make_batch(chunk)
-        wanted = {b["id"] for b in batch}
+        handled.extend(chunk)
         try:
-            requests_made += 1
-            got = parse_ai(ask_ai(batch, model, key, mock))
-            got = {k: v for k, v in got.items() if k in wanted}
-            results.update(got)
-            missing = [ev for ev in chunk if event_id(ev) not in got]
-            print(f"Batch {requests_made}: asked {len(chunk)}, received {len(got)}")
-            # The AI sometimes leaves stories out: ask once more for just those.
-            if missing and requests_made < MAX_AI_REQUESTS:
-                requests_made += 1
-                retry = make_batch(missing)
-                got2 = parse_ai(ask_ai(retry, model, key, mock))
-                got2 = {k: v for k, v in got2.items() if k in {r["id"] for r in retry}}
-                results.update(got2)
-                print(f"Batch {requests_made} (retry): asked {len(missing)}, received {len(got2)}")
-                skipped += len(missing) - len(got2)
-            else:
-                skipped += len(missing)
+            attempt(chunk, "")
         except Exception as e:
             errors.append(str(e)[:200])
             print(f"AI batch failed: {e}", file=sys.stderr)
-    return results, {"model": model, "requests": requests_made, "errors": errors, "skipped": skipped}
+            # A damaged reply loses the whole batch: try the two halves separately.
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                for piece in (chunk[:mid], chunk[mid:]):
+                    if state["requests"] >= MAX_AI_REQUESTS:
+                        break
+                    try:
+                        attempt(piece, " (half)")
+                    except Exception as e2:
+                        errors.append(str(e2)[:200])
+                        print(f"AI half-batch failed: {e2}", file=sys.stderr)
+            continue
+        # The AI sometimes leaves stories out: ask once more for just those.
+        left = missing_of(chunk)
+        if left and state["requests"] < MAX_AI_REQUESTS:
+            try:
+                attempt(left, " (retry)")
+            except Exception as e:
+                errors.append(str(e)[:200])
+                print(f"AI retry failed: {e}", file=sys.stderr)
+    skipped = len(missing_of(handled))
+    return results, {"model": model, "requests": state["requests"], "errors": errors,
+                     "skipped": skipped}
 
 # -------------------------------------------------------------------------- main
 
