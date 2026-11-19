@@ -28,8 +28,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_FILE = ROOT / "data" / "stories.json"
 
-WINDOW_HOURS = 72            # stories older than this are dropped
-MAX_EVENTS = 400             # size limit for the published file
+WINDOW_HOURS = 96            # stories older than this are dropped
+MAX_EVENTS = 500             # size limit for the published file
 BATCH_SIZE = 8               # stories per AI request
 MAX_AI_REQUESTS = 16         # AI requests per run (keeps the free tier safe)
 EXCERPT_FOR_AI = 600         # characters of each excerpt sent to the AI
@@ -504,21 +504,30 @@ def main():
     items, report = collect(sources, args.fixtures)
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
-    items = [i for i in items if i["published"] >= cutoff]
-    items.sort(key=lambda i: i["published"], reverse=True)
+    previous_doc = load_previous(target)
+
+    # Remember headlines from earlier runs. This keeps stories (and their AI notes) when a feed
+    # fails today or when a headline has scrolled out of the feed but is still recent.
+    merged = {}
+    for e in previous_doc.get("events", []):
+        for src in e.get("sources", []):
+            when = parse_date(src.get("published", ""))
+            if when and src.get("link"):
+                merged[src["link"]] = {"source": src["name"], "title": src["title"],
+                                       "link": src["link"], "snippet": "", "published": when}
+    for i in items:                                 # today's items win: they carry the excerpt
+        merged[i["link"]] = i
+    items = [i for i in merged.values() if i["published"] >= cutoff]
+    items.sort(key=lambda i: (i["published"], i["link"]), reverse=True)
     events = group(items)[:MAX_EVENTS]
 
-    previous = {e["id"]: e for e in load_previous(target).get("events", [])}
+    cache = {e["links_hash"]: e for e in previous_doc.get("events", [])
+             if e.get("ai") and e.get("links_hash")}
     key = os.environ.get("GEMINI_API_KEY", "").strip()
 
-    pending = []
-    for ev in events:
-        old = previous.get(event_id(ev))
-        if old and old.get("ai") and old.get("links_hash") == links_hash(ev):
-            continue                               # unchanged story: reuse its summary
-        pending.append(ev)
-    # multi-source stories first, then newest
-    pending.sort(key=lambda ev: (-len(ev), -max(i["published"] for i in ev).timestamp()))
+    # Newest stories first: that is the order the app shows them in.
+    pending = [ev for ev in events if links_hash(ev) not in cache]
+    pending.sort(key=lambda ev: -max(i["published"] for i in ev).timestamp())
 
     ai_stats = {"model": None, "requests": 0, "errors": [], "skipped": 0}
     results = {}
@@ -531,11 +540,11 @@ def main():
     out_events = []
     for ev in events:
         eid = event_id(ev)
-        old = previous.get(eid)
+        old = cache.get(links_hash(ev))
         ai, ai_at, ai_model = None, None, None
         if eid in results:
             ai, ai_at, ai_model = results[eid], now, ai_stats["model"]
-        elif old and old.get("ai") and old.get("links_hash") == links_hash(ev):
+        elif old:
             ai, ai_at, ai_model = old["ai"], old.get("ai_at"), old.get("ai_model")
         out_events.append({
             "id": eid,
