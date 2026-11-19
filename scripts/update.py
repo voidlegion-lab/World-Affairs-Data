@@ -30,8 +30,9 @@ DATA_FILE = ROOT / "data" / "stories.json"
 
 WINDOW_HOURS = 96            # stories older than this are dropped
 MAX_EVENTS = 500             # size limit for the published file
-BATCH_SIZE = 8               # stories per AI request
-MAX_AI_REQUESTS = 16         # AI requests per run (keeps the free tier safe)
+BATCH_SIZE = 6               # stories per AI request
+MAX_AI_REQUESTS = 20         # AI requests per run (keeps the free tier safe)
+PROMPT_VERSION = 2           # raise when the instructions change: old notes are rewritten over time
 EXCERPT_FOR_AI = 600         # characters of each excerpt sent to the AI
 USER_AGENT = "Mozilla/5.0 (compatible; WorldAffairsPersonalReader/1.0)"
 
@@ -255,19 +256,19 @@ Rules:
 3. Stay neutral. Separate confirmed facts from claims, allegations, opinions and predictions; put the latter in "unconfirmed".
 4. If sources give different figures or accounts, describe the difference in "discrepancies"; otherwise use [].
 5. Write in your own words. Do not copy sentences and do not use direct quotations.
-6. "background_ai" may use well-established general knowledge to give context (2-3 sentences). If you are not sure, return "". It is unverified.
+6. "background_ai": give 2-4 sentences of context for a reader who has not followed the story: who the main parties are, what led up to this, and any closely related earlier events. Use only widely known, well-established facts. Avoid exact figures or dates unless you are certain, and leave out any detail you are not confident about. If you have nothing reliable to add, return "". The app labels it unverified.
 7. "exam_points": up to 5 short facts (people, organisations, agreements, dates, statistics) taken from the supplied text that could be asked in a competitive exam. No outside facts.
 Return ONLY valid JSON, with no commentary."""
 
 SCHEMA_HINT = """Return JSON in exactly this shape:
 {"stories": [{"id": "<same id as given>",
  "short_summary": "1-2 sentences",
- "detailed_summary": "3-6 sentences using only the supplied text",
+ "detailed_summary": "4-7 sentences using only the supplied text: who, what, where, when, and the main developments",
  "key_facts": ["..."],
  "unconfirmed": ["..."],
  "discrepancies": ["..."],
  "significance": "1-2 sentences that follow only from the supplied text",
- "background_ai": "",
+ "background_ai": "2-4 sentences of context, or empty",
  "exam_points": ["..."]}]}"""
 
 _STR = {"type": "STRING"}
@@ -526,7 +527,10 @@ def main():
     key = os.environ.get("GEMINI_API_KEY", "").strip()
 
     # Newest stories first: that is the order the app shows them in.
-    pending = [ev for ev in events if links_hash(ev) not in cache]
+    def is_fresh(old):
+        return bool(old) and old.get("ai_version") == PROMPT_VERSION
+
+    pending = [ev for ev in events if not is_fresh(cache.get(links_hash(ev)))]
     pending.sort(key=lambda ev: -max(i["published"] for i in ev).timestamp())
 
     ai_stats = {"model": None, "requests": 0, "errors": [], "skipped": 0}
@@ -541,11 +545,12 @@ def main():
     for ev in events:
         eid = event_id(ev)
         old = cache.get(links_hash(ev))
-        ai, ai_at, ai_model = None, None, None
+        ai, ai_at, ai_model, ai_version = None, None, None, None
         if eid in results:
-            ai, ai_at, ai_model = results[eid], now, ai_stats["model"]
+            ai, ai_at, ai_model, ai_version = results[eid], now, ai_stats["model"], PROMPT_VERSION
         elif old:
             ai, ai_at, ai_model = old["ai"], old.get("ai_at"), old.get("ai_model")
+            ai_version = old.get("ai_version")
         out_events.append({
             "id": eid,
             "links_hash": links_hash(ev),
@@ -553,7 +558,7 @@ def main():
             "title": ev[0]["title"],
             "sources": [{"name": i["source"], "title": i["title"], "link": i["link"],
                          "published": i["published"].isoformat(timespec="seconds")} for i in ev],
-            "ai": ai, "ai_at": ai_at, "ai_model": ai_model,
+            "ai": ai, "ai_at": ai_at, "ai_model": ai_model, "ai_version": ai_version,
         })
 
     summarised = sum(1 for e in out_events if e["ai"])
