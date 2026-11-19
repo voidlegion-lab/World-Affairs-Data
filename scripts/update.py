@@ -32,7 +32,7 @@ WINDOW_HOURS = 96            # stories older than this are dropped
 MAX_EVENTS = 500             # size limit for the published file
 BATCH_SIZE = 6               # stories per AI request
 MAX_AI_REQUESTS = 20         # AI requests per run (keeps the free tier safe)
-PROMPT_VERSION = 2           # raise when the instructions change: old notes are rewritten over time
+PROMPT_VERSION = 3           # raise when the instructions change: old notes are rewritten over time
 EXCERPT_FOR_AI = 600         # characters of each excerpt sent to the AI
 USER_AGENT = "Mozilla/5.0 (compatible; WorldAffairsPersonalReader/1.0)"
 
@@ -257,7 +257,8 @@ Rules:
 4. If sources give different figures or accounts, describe the difference in "discrepancies"; otherwise use [].
 5. Write in your own words. Do not copy sentences and do not use direct quotations.
 6. "background_ai": give 2-4 sentences of context for a reader who has not followed the story: who the main parties are, what led up to this, and any closely related earlier events. Use only widely known, well-established facts. Avoid exact figures or dates unless you are certain, and leave out any detail you are not confident about. If you have nothing reliable to add, return "". The app labels it unverified.
-7. "exam_points": up to 5 short facts (people, organisations, agreements, dates, statistics) taken from the supplied text that could be asked in a competitive exam. No outside facts.
+7. "exam_points": up to 6 short facts taken ONLY from the supplied text that a competitive-exam question could be built on: dates of events, people with their designations, agreements with their dates, parties and places, locations, organisations, statistics. No outside facts here.
+8. "exam_background": up to 6 short, stable general-knowledge facts a competitive-exam candidate should know about the people, organisations, agreements, places or conflicts in this story. Format each as "Subject - fact". Examples of useful facts: for a person, the office held and since when, political party, and for a head of state or government the ordinal number (such as 47th president); for a conflict, its main cause and when it began; for a treaty or agreement, the date signed, the parties and the place; for an organisation, the year founded and headquarters; for a place, where it is. Include a date or number ONLY if you are certain of it; otherwise describe the fact without it, or leave the item out. Never guess. Who currently holds an office must follow the supplied text, not your memory, because your memory may be out of date. These facts are unverified and the app labels them so.
 Return ONLY valid JSON, with no commentary."""
 
 SCHEMA_HINT = """Return JSON in exactly this shape:
@@ -269,7 +270,8 @@ SCHEMA_HINT = """Return JSON in exactly this shape:
  "discrepancies": ["..."],
  "significance": "1-2 sentences that follow only from the supplied text",
  "background_ai": "2-4 sentences of context, or empty",
- "exam_points": ["..."]}]}"""
+ "exam_points": ["..."],
+ "exam_background": ["Subject - fact"]}]}"""
 
 _STR = {"type": "STRING"}
 _LIST = {"type": "ARRAY", "items": {"type": "STRING"}}
@@ -281,16 +283,18 @@ RESPONSE_SCHEMA = {
             "id": _STR, "short_summary": _STR, "detailed_summary": _STR,
             "key_facts": _LIST, "unconfirmed": _LIST, "discrepancies": _LIST,
             "significance": _STR, "background_ai": _STR, "exam_points": _LIST,
+            "exam_background": _LIST,
         },
         "required": ["id", "short_summary", "detailed_summary", "key_facts", "unconfirmed",
-                     "discrepancies", "significance", "background_ai", "exam_points"],
+                     "discrepancies", "significance", "background_ai", "exam_points",
+                     "exam_background"],
     }}},
     "required": ["stories"],
 }
 _use_schema = True
 
 AI_TEXT_FIELDS = ["short_summary", "detailed_summary", "significance", "background_ai"]
-AI_LIST_FIELDS = ["key_facts", "unconfirmed", "discrepancies", "exam_points"]
+AI_LIST_FIELDS = ["key_facts", "unconfirmed", "discrepancies", "exam_points", "exam_background"]
 
 
 def http_json(url, key, body=None, timeout=120):
@@ -385,6 +389,7 @@ def mock_gemini(batch):
         "unconfirmed": [], "discrepancies": [],
         "significance": "MOCK significance.",
         "background_ai": "", "exam_points": ["MOCK exam point"],
+        "exam_background": ["MOCK subject - MOCK fact"],
     } for b in batch]})
 
 
